@@ -1,6 +1,6 @@
 # CMDIF Method
 A framework for extracting surface water using collaborative optical and SAR images.Here we present the sample code of CMDIF, including registration of different data sources, water body extraction from Sentinel-2 images, water body extraction from Sentinel-1 images, as well as the complete process of CMDIF. Due to the computing power limitations of the GEE platform, we use a part of Kyoga Lake as an example for demonstration. During the actual process, we adopt a phased data processing approach for large-scale water system mapping, that is, each part of the data processing is downloaded to the local area for parameter evaluation, data fusion, etc. The provided code also includes the main functions implemented in this study, which can provide certain references for researchers.All the codes are written using JavaScript scripts. Researchers can simply copy them and view them on the GEE platform.
-![IMG]{https://github.com/ZBK06/CMDIF/blob/main/img/CMDIF.png}
+![IMG](https://github.com/ZBK06/CMDIF/blob/main/img/CMDIF.png)
 
 # CMDIF_data registration
 We demonstrated using the public dataset registration data from 2021, integrating the resolutions and geographic coordinates of multiple data sources.
