@@ -1,0 +1,123 @@
+var roi = ee.Geometry.Polygon(
+        [[[32.81201278251589, 1.7035206744239066],
+          [32.81201278251589, 1.272453722443622],
+          [33.32287704032839, 1.272453722443622],
+          [33.32287704032839, 1.7035206744239066]]], null, false);
+
+// Set the time range
+var startDate = '2023-11-01';
+var endDate = '2023-12-01';
+
+// Use the JRC dataset
+var band = ['occurrence'];
+var GSW = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').clip(roi).select(band);
+// Visualization of water body occurrence frequency
+var visualization = {
+  bands: ['occurrence'],
+  min: 0.0,
+  max: 100.0,
+  palette: ['ffffff', 'ffbbbb', '0000ff']
+};
+Map.addLayer(GSW, visualization, 'Occurrence');
+
+// Use the Sentinel-1 dataset
+var s1Collection = ee.ImageCollection('COPERNICUS/S1_GRD')
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))  // 确保含有VH极化
+  .filter(ee.Filter.eq('instrumentMode', 'IW'));
+
+// Define the SDWI calculation function
+function S1addIndices(image) {
+  var vv = image.select('VV');
+  var vh = image.select('VH');
+  var SDWI = image.expression('log(10*VV*VH)-8', {'VV': vv, 'VH': vh}).rename('SDWI');
+  return image.addBands([SDWI]);
+}
+
+// Calculate SDWI
+var s1SDWI = s1Collection.map(S1addIndices).select("SDWI");
+
+// Merge the SDWI layers
+var sdwiComposite = s1SDWI.median().clip(roi);
+// SNIC superpixel segmentation
+var segmentation = ee.Algorithms.Image.Segmentation.SNIC({
+    image: sdwiComposite,
+    size: 14,  
+    compactness: 0.1, 
+    connectivity: 8  
+  }).select(['SDWI_mean', 'clusters'], ['SDWI', 'clusters']);
+// Edge-Otsu
+var biocut = segmentation.select('SDWI').gte(0.59);
+var canny = ee.Algorithms.CannyEdgeDetector(biocut, 1, 1);
+canny = canny.clip(roi).unmask();
+var connected = canny.updateMask(canny).lt(0.05).connectedPixelCount(500, true);
+var edges = connected.gte(5);
+edges = edges.updateMask(edges);
+var edgeBuffer = edges.focal_max(5, 'square', 'meters');
+var histogram_image = segmentation.select('SDWI').updateMask(edgeBuffer);
+var histogram_ = histogram_image.select('SDWI').reduceRegion({
+    reducer: ee.Reducer.histogram(255, 0.25),
+    geometry: roi,
+    scale: 10,
+    bestEffort: true
+});
+var hist_dict = histogram_.getInfo();
+var threshold1 = otsu(histogram_.get('SDWI'));
+var waterImgPre = ee.Image(ee.Algorithms.If(false, segmentation.lt(threshold1), segmentation.gt(threshold1))).selfMask().clip(roi);
+var waterImg = waterImgPre.select('SDWI').unmask(0);
+
+Map.addLayer(waterImg, {min:0,max:1,palette:['white','blue']}, 'WaterImg');
+
+// Visualized water body mask
+var visParams = {
+  min: 0,
+  max: 1,
+  palette: ['FFFFFF', '0000FF'] 
+};
+
+// Display the water mask on the map
+Map.centerObject(roi, 10);
+Map.addLayer(sdwiComposite, {bands: ['SDWI'], min: -1, max: 1}, "sentinel-1");
+Map.addLayer(waterImg, visParams, 'SDWI Water Mask SNIC');
+
+// Export the results to the cloud hard drive
+Export.image.toDrive({
+  image: waterImg,
+  description: 'CMDIF_S1',
+  fileNamePrefix: 'CMDIF_S1', 
+  region: roi,  
+  scale: 10, 
+  maxPixels: 1e13,  
+  fileFormat: 'GeoTIFF' 
+});
+
+// Define the OTSU algorithm
+function otsu(histogram) {
+    var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+    var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+    var size = means.length().get([0]);
+    var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean = sum.divide(total);
+
+    var indices = ee.List.sequence(1, size);
+
+    // Compute between sum of squares, where each mean partitions the data.
+    var bss = indices.map(function(i) {
+        var aCounts = counts.slice(0, 0, i);
+        var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+        var aMeans = means.slice(0, 0, i);
+        var aMean = aMeans.multiply(aCounts)
+            .reduce(ee.Reducer.sum(), [0]).get([0])
+            .divide(aCount);
+        var bCount = total.subtract(aCount);
+        var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+        return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+            bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+
+    // Return the mean value corresponding to the maximum BSS.
+    return means.sort(bss).get([-1]);
+}
