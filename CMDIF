@@ -1,0 +1,311 @@
+// dataset
+var dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
+var esa = ee.ImageCollection("ESA/WorldCover/v200");
+var jrc_month = ee.ImageCollection("JRC/GSW1_4/MonthlyHistory");
+var dem = ee.Image("USGS/SRTMGL1_003");
+var ghsl = ee.Image('JRC/GHSL/P2023A/GHS_BUILT_S_10m/2018').select('built_surface');
+var jrc_gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+var S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
+var S1 = ee.ImageCollection('COPERNICUS/S1_GRD');
+var roi = ee.Geometry.Polygon(
+        [[[32.81201278251589, 1.7035206744239066],
+          [32.81201278251589, 1.272453722443622],
+          [33.32287704032839, 1.272453722443622],
+          [33.32287704032839, 1.7035206744239066]]], null, false);
+
+//Part1 - Samples_Generate
+// select S2_bands
+var S2bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12'];
+var year = 2021
+// Loop through the defined time range
+for (var month = 11; month <= 11; month++) {
+  var startDate = ee.Date.fromYMD(year, month, 1);
+  var endDate = startDate.advance(1, 'month');
+
+  // Load Sentinel-2 data
+  var S2_image = S2.filterBounds(roi)
+                   .filterDate(startDate, endDate)
+                   .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+                   .map(maskS2clouds)
+                   .select(S2bands)
+                   .map(S2addIndices)
+                   .map(function(image) {
+                     return image.clip(roi);
+                   });
+
+  var S2_median = S2_image.median();
+  print('S2_median for month:', month, S2_median);
+  
+  // Calculate texture features using glcmTexture
+  var glcmParams = {size: 3,average: true};
+  // Extract the texture features of NDVI and mNDWI
+  var ndviTexture = S2_median.select('ndvi').unitScale(-1, 1).multiply(255).toByte().glcmTexture(glcmParams);
+  var ndviTextureFeatures = ndviTexture.select(['ndvi_contrast', 'ndvi_diss', 'ndvi_ent', 'ndvi_asm', 'ndvi_savg', 'ndvi_var', 'ndvi_idm', 'ndvi_corr']);
+  print('ndviTextureFeatures',ndviTextureFeatures);
+  var mndwiTexture = S2_median.select('mNDWI').unitScale(-1, 1).multiply(255).toByte().glcmTexture(glcmParams);
+  var ndwiTextureFeatures = mndwiTexture.select(['mNDWI_contrast', 'mNDWI_diss', 'mNDWI_ent', 'mNDWI_asm', 'mNDWI_savg', 'mNDWI_var', 'mNDWI_idm', 'mNDWI_corr']);
+  print('ndwiTextureFeatures',ndwiTextureFeatures);
+  // Extract terrain features
+  var dem = ee.Image('USGS/SRTMGL1_003').clip(roi);
+  var terrain = ee.Terrain.products(dem);
+  var slope = terrain.select('slope');
+  var aspect = terrain.select('aspect');
+  // Loading Dynamic World data
+  var dwComposite = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+                      .filterDate(startDate, endDate)
+                      .filterBounds(roi)
+                      .select('label')
+                      .reduce(ee.Reducer.mode())
+                      .clip(roi);
+
+  var dwCompositeRemapped = dwComposite.remap([0,1,2,3,4,5,6,7,8],[0,1,1,1,1,1,2,3,4]).rename('landcover');
+  print("dwCompositeRemapped for month:", month, dwCompositeRemapped);
+
+  // Combine the data from Sentinel-2 with that from Dynamic World
+  var S2Features = S2_median.addBands(dwCompositeRemapped).addBands(ndwiTextureFeatures).addBands(ndviTextureFeatures).addBands(slope).addBands(aspect);
+  print('S2Features for month:', month, S2Features);
+
+  // stratified sampling method
+  var stratifiedSample = S2Features.stratifiedSample({
+    numPoints: 1200,  // The number of samples for each category can be adjusted as needed.
+    classBand: 'landcover',  // The attributes used for stratification
+    region: roi,  // The sampled area
+    scale: 10,  // resolution
+    geometries: true
+  });
+
+  print('Stratified Sample for month:', month, stratifiedSample);
+
+  // Add to the map for visualization
+  Map.addLayer(S2_median, {bands: ['B8', 'B3', 'B2'], min: 0, max: 0.3}, 'S2_resampled_' + month);
+  
+  // Visual sampling points
+  var sampleVisParams1 = {color: 'red', pointSize: 5};
+  Map.addLayer(stratifiedSample, sampleVisParams1, 'Sample Landcover ' + month);
+
+  // Export the sample set as an SHP file and categorize by month.
+  Export.table.toDrive({
+    collection: stratifiedSample,
+    description: 'S2Expert_' + year + '_' + month,
+    fileFormat: 'SHP'
+  });
+}
+
+
+// Part2-Optical image random forest classification
+var alldata = stratifiedSample.randomColumn('random');
+// Divide the samples into training samples and test samples
+var training_samples = alldata.filter(ee.Filter.lte('random',0.7)); // Select 70% of the samples as the training samples
+var test_samples = alldata.filter(ee.Filter.gte('random',0.7));// Select 30% of the samples as the test samples
+// Check whether the filtered samples possess complete spectral information.
+print("Filtered Training Samples:", training_samples);
+print("Filtered Test Samples:", test_samples);
+// Train the random forest classifier
+var classifier = ee.Classifier.smileRandomForest(100).train({
+  features:training_samples,
+  classProperty:'landcover',
+  inputProperties:S2bands
+})
+var classifed = S2_median.classify(classifier);
+var VIS_PALETTE = ['blue', 'green', 'red','yellow','white'];
+// Modify the label values of the classification results, changing 0, 1, 2, 3 to 1, 2, 3, 4.
+var updated_classified = classifed.remap([0,1,2,3,4], [1,2,3,4,5]);
+Map.addLayer(updated_classified, {min:1, max:5, palette:VIS_PALETTE}, 'landcover updated');
+
+
+// Part3-Sentinel 1 Water Body Extraction
+var startDate = '2021-11-01';
+var endDate = '2021-12-01';
+var s1Collection = S1.filterBounds(roi)
+                     .filterDate(startDate, endDate)
+                     .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
+                     .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))  // 确保含有VH极化
+                     .filter(ee.Filter.eq('instrumentMode', 'IW'));
+// Calculate SDWI
+var s1SDWI = s1Collection.map(S1addIndices).select("SDWI");
+// Merge the SDWI layers
+var sdwiComposite = s1SDWI.median().clip(roi);
+// SNIC superpixel segmentation
+var segmentation = ee.Algorithms.Image.Segmentation.SNIC({
+    image: sdwiComposite,
+    size: 14,
+    compactness: 0.1, 
+    connectivity: 8 
+  }).select(['SDWI_mean', 'clusters'], ['SDWI', 'clusters']);
+// Edge-Otsu
+var biocut = segmentation.select('SDWI').gte(0.59);
+var canny = ee.Algorithms.CannyEdgeDetector(biocut, 1, 1);
+canny = canny.clip(roi).unmask();
+var connected = canny.updateMask(canny).lt(0.05).connectedPixelCount(500, true);
+var edges = connected.gte(5);
+edges = edges.updateMask(edges);
+var edgeBuffer = edges.focal_max(5, 'square', 'meters');
+var histogram_image = segmentation.select('SDWI').updateMask(edgeBuffer);
+var histogram_ = histogram_image.select('SDWI').reduceRegion({
+    reducer: ee.Reducer.histogram(255, 0.25),
+    geometry: roi,
+    scale: 10,
+    bestEffort: true
+});
+var hist_dict = histogram_.getInfo();
+var threshold1 = otsu(histogram_.get('SDWI'));
+var waterImgPre = ee.Image(ee.Algorithms.If(false, segmentation.lt(threshold1), segmentation.gt(threshold1))).selfMask().clip(roi);
+var waterImg = waterImgPre.select('SDWI').unmask(0);
+
+Map.addLayer(waterImg, {min:0,max:1,palette:['white','blue']}, 'WaterImg');
+
+// Part4-Hierarchical decision tree
+// Obtain the water body frequency and the maximum inundation range
+var dwComposite = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+                    .filterDate('2019-01-01', '2022-01-01')
+                    .filterBounds(roi)
+                    .select('label')
+                    .map(function(image) {
+                     return image.remap([0,1,2,3,4,5,6,7,8],[1,0,0,0,0,0,0,0,0]).clip(roi).unmask(0);
+                   });
+var waterFrequency = dwComposite.reduce(ee.Reducer.mean())
+                               .clip(roi)
+                               .multiply(100)
+                               .rename('Water Frequency');
+var maxWaterExtent = waterFrequency.gte(5);
+var waterVisParams = {min: 0,max: 100,palette: ['white', 'blue']};
+Map.addLayer(maxWaterExtent,{min:0,max:1,palette:['white','blue']}, 'maxWaterExtent');
+Map.addLayer(waterFrequency, waterVisParams, 'water Frequency');
+
+//=== Parameter Settings ===
+var DW_WaterFreq_Threshold = 20;
+// === Determine the areas without Sentinel-2 data ===
+var s2_nodata_mask = updated_classified.mask().not();  
+var s2_valid_mask = updated_classified.mask();        
+// === Sentinel-1 Only Method ===
+var s1_result = waterImg.where(waterImg.not(), 0) 
+                        .updateMask(s2_nodata_mask); 
+
+// === Combined Method (Effective Area of S2) ===
+var dw_valid = waterFrequency.gt(DW_WaterFreq_Threshold); 
+var dw_temp = dw_valid.not();               
+
+var rf_pass = updated_classified.eq(1);     
+
+// Effective water body: DW > 20% (where SDWI > threshold) or (RF = 1)
+var valid_water = waterImg.or(rf_pass)
+  .where(waterImg.or(rf_pass).not(), 0)
+  .updateMask(dw_valid)
+  .updateMask(s2_valid_mask);
+
+// Temporary water body: DW ≤ 20% (where SDWI is above the threshold) and (RF = 1)
+var temp_water = waterImg.and(rf_pass)
+  .where(waterImg.and(rf_pass).not(), 0)
+  .updateMask(dw_temp)
+  .updateMask(s2_valid_mask);
+
+// === Final Integration ===
+var result = ee.Image(0)
+  .where(s2_nodata_mask, s1_result)           //  If S2 has no data → Use the S1 method
+  .where(valid_water.mask(), valid_water)     // DW > 20% and meet the criteria
+  .where(temp_water.mask(), temp_water).updateMask(maxWaterExtent).unmask(0);      // DW is less than or equal to 20% and meets the criteria.
+
+// Define the altitude threshold for plains
+var elevation_threshold = 500;
+var slope_threshold = 5; // Set the slope threshold, with the unit being degrees.
+// Calculate the slope
+var slope = ee.Terrain.slope(dem);
+// Create a plain mask, select the area with an altitude of less than 500 meters.
+var plains_mask = dem.lt(elevation_threshold).clip(roi);
+// Create a slope mask for high-altitude areas, and select the regions with less terrain fluctuation (S < S0)
+var slope_mask = slope.lt(slope_threshold).clip(roi);
+// Filtering and merging the water body results using plain mask and slope mask
+var filtered_water = result.updateMask(plains_mask.or(slope_mask)).clip(roi);
+// Use the GHSL mask to remove the shadows of buildings
+var ghsl_mask = ghsl.lt(10).clip(roi); 
+var final_water = filtered_water.updateMask(ghsl_mask).unmask(0).clip(roi);
+// === Visualization ===
+Map.addLayer(final_water, {min: 0, max: 1,palette: ['ffffff', '0000ff']}, 'Final Water Mask');
+
+Export.image.toDrive({
+  image: result,
+  description: 'CMDIF_result',
+  fileNamePrefix: 'CMDIF_result',  
+  region: roi,  
+  scale: 10,  
+  maxPixels: 1e13,  
+  fileFormat: 'GeoTIFF' 
+});
+
+// Define the index functions for water bodies, vegetation, and architectural features
+function S2addIndices(image) {
+  var lswi = image.normalizedDifference(['B8', 'B12']).rename('LSWI');
+  var mndwi = image.normalizedDifference(['B3', 'B11']).rename('mNDWI');
+  var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var aweish = image.expression(
+    'B2 + 2.5 * B3 - 1.5 * (B8 + B11) - 0.25 * B12', {
+      'B2': image.select('B2'),
+      'B3': image.select('B3'),
+      'B8': image.select('B8'),
+      'B11': image.select('B11'),
+      'B12': image.select('B12')
+  }).rename('AWEIsh').toFloat();
+  var aweinsh = image.expression(
+    '4 * (B2 - B11) - (0.25 * B8 + 2.75 * B12)', {
+      'B2': image.select('B2'),
+      'B8': image.select('B8'),
+      'B11': image.select('B11'),
+      'B12': image.select('B12')
+  }).rename('AWEInsh').toFloat();
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
+  var evi = image.expression(  
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',{
+    NIR:image.select('B5'),
+    RED:image.select('B4'),
+    BLUE:image.select('B2')}).rename('evi');
+  var savi = image.expression(
+    '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+  }).rename('savi');
+  return image.addBands([lswi,mndwi,ndwi,aweish,aweinsh,ndvi,evi,savi]);
+}
+// Definition of the SDWI calculation function
+function S1addIndices(image) {
+  var vv = image.select('VV');
+  var vh = image.select('VH');
+  var SDWI = image.expression('log(10*VV*VH)-8', {'VV': vv, 'VH': vh}).rename('SDWI');
+  return image.addBands([SDWI]);
+}
+// Define the cloud mask function
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+                .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+} 
+// Define the OTSU algorithm
+function otsu(histogram) {
+    var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
+    var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
+    var size = means.length().get([0]);
+    var total = counts.reduce(ee.Reducer.sum(), [0]).get([0]);
+    var sum = means.multiply(counts).reduce(ee.Reducer.sum(), [0]).get([0]);
+    var mean = sum.divide(total);
+
+    var indices = ee.List.sequence(1, size);
+
+    // Compute between sum of squares, where each mean partitions the data.
+    var bss = indices.map(function(i) {
+        var aCounts = counts.slice(0, 0, i);
+        var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
+        var aMeans = means.slice(0, 0, i);
+        var aMean = aMeans.multiply(aCounts)
+            .reduce(ee.Reducer.sum(), [0]).get([0])
+            .divide(aCount);
+        var bCount = total.subtract(aCount);
+        var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
+        return aCount.multiply(aMean.subtract(mean).pow(2)).add(
+            bCount.multiply(bMean.subtract(mean).pow(2)));
+    });
+
+    // Return the mean value corresponding to the maximum BSS.
+    return means.sort(bss).get([-1]);
+}
