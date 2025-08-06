@@ -1,4 +1,4 @@
-// 1. Load the public dataset
+// 1. Load public datasets
 var dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
 var esa = ee.ImageCollection("ESA/WorldCover/v200");
 var jrc_month = ee.ImageCollection("JRC/GSW1_4/MonthlyHistory");
@@ -6,13 +6,14 @@ var dem = ee.Image("USGS/SRTMGL1_003");
 var ghsl = ee.Image('JRC/GHSL/P2023A/GHS_BUILT_S_10m/2018').select('built_surface');
 var jrc_gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
 
+// 2. Define Region of Interest (ROI)
 var roi = ee.Geometry.Polygon(
         [[[32.133640796357454, 1.7932051669751303],
           [32.133640796357454, 1.3429355548692092],
           [32.770847827607454, 1.3429355548692092],
           [32.770847827607454, 1.7932051669751303]]], null, false);
 
-// 2. Obtain the sample image of Dynamic World and extract its projection information
+// 3. Get Dynamic World sample and extract projection info
 var dw_sample = dw
   .filterBounds(roi)
   .filterDate('2021-01-01', '2021-01-31')
@@ -27,17 +28,14 @@ var dw_transform = dw_proj_info.transform;
 print('DW projection:', dw_proj);
 print('DW transform:', dw_transform);
 
-// 3.Encapsulate the re-projection function (aligned to Dynamic World)
+// 4. Function to align images to Dynamic World projection
 function alignToDW(image) {
   return image
-    .reproject({
-      crs: dw_crs,
-      crsTransform: dw_transform
-    })
+    .reproject({crs: dw_crs, crsTransform: dw_transform})
     .clip(roi);
 }
 
-// 4. Align the data sets for each dataset
+// 5. Align datasets to Dynamic World projection
 var dw_img = dw
   .filterBounds(roi)
   .filterDate('2021-01-01', '2021-01-31')
@@ -49,14 +47,14 @@ var dw_img = dw
 var esa_img = alignToDW(esa.first());
 var jrc_month_img = alignToDW(jrc_month.first());
 var dem_img = alignToDW(dem);
-var ghsl_img = alignToDW(ghsl); 
+var ghsl_img = alignToDW(ghsl);
 var jrc_gsw_img = alignToDW(jrc_gsw.select('occurrence'));
 
+// 6. Color palette for visualization
 var VIS_PALETTE = ['419bdf', '397d49', '88b053', '7a87c6', 'e49635', 'dfc35a', 'c4281b',
     'a59b8f', 'b39fe1'];
 
-
-// 5. Visual inspection
+// 7. Map visualization
 Map.centerObject(roi, 10);
 Map.addLayer(dw_img, {min: 0, max: 8, palette: VIS_PALETTE}, 'DW aligned');
 Map.addLayer(esa_img, {}, 'ESA aligned');
