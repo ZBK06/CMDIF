@@ -1,0 +1,65 @@
+// 1. Load the public dataset
+var dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
+var esa = ee.ImageCollection("ESA/WorldCover/v200");
+var jrc_month = ee.ImageCollection("JRC/GSW1_4/MonthlyHistory");
+var dem = ee.Image("USGS/SRTMGL1_003");
+var ghsl = ee.Image('JRC/GHSL/P2023A/GHS_BUILT_S_10m/2018').select('built_surface');
+var jrc_gsw = ee.Image('JRC/GSW1_4/GlobalSurfaceWater');
+
+var roi = ee.Geometry.Polygon(
+        [[[32.133640796357454, 1.7932051669751303],
+          [32.133640796357454, 1.3429355548692092],
+          [32.770847827607454, 1.3429355548692092],
+          [32.770847827607454, 1.7932051669751303]]], null, false);
+
+// 2. Obtain the sample image of Dynamic World and extract its projection information
+var dw_sample = dw
+  .filterBounds(roi)
+  .filterDate('2021-01-01', '2021-01-31')
+  .first()
+  .select('label');
+
+var dw_proj = dw_sample.projection();
+var dw_proj_info = dw_proj.getInfo();
+var dw_crs = dw_proj_info.crs;
+var dw_transform = dw_proj_info.transform;
+
+print('DW projection:', dw_proj);
+print('DW transform:', dw_transform);
+
+// 3.Encapsulate the re-projection function (aligned to Dynamic World)
+function alignToDW(image) {
+  return image
+    .reproject({
+      crs: dw_crs,
+      crsTransform: dw_transform
+    })
+    .clip(roi);
+}
+
+// 4. Align the data sets for each dataset
+var dw_img = dw
+  .filterBounds(roi)
+  .filterDate('2021-01-01', '2021-01-31')
+  .select('label')
+  .reduce(ee.Reducer.mode())
+  .reproject({crs: dw_crs, crsTransform: dw_transform})
+  .clip(roi);
+
+var esa_img = alignToDW(esa.first());
+var jrc_month_img = alignToDW(jrc_month.first());
+var dem_img = alignToDW(dem);
+var ghsl_img = alignToDW(ghsl); 
+var jrc_gsw_img = alignToDW(jrc_gsw.select('occurrence'));
+
+var VIS_PALETTE = ['419bdf', '397d49', '88b053', '7a87c6', 'e49635', 'dfc35a', 'c4281b',
+    'a59b8f', 'b39fe1'];
+
+
+// 5. Visual inspection
+Map.centerObject(roi, 10);
+Map.addLayer(dw_img, {min: 0, max: 8, palette: VIS_PALETTE}, 'DW aligned');
+Map.addLayer(esa_img, {}, 'ESA aligned');
+Map.addLayer(dem_img, {min: 0, max: 3000}, 'DEM aligned');
+Map.addLayer(ghsl_img, {min: 0, max: 100}, 'GHSL aligned');
+Map.addLayer(jrc_gsw_img, {min: 0, max: 100, palette: ['ffffff', 'ffbbbb', '0000ff']}, 'GSW aligned');
