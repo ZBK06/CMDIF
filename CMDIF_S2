@@ -1,121 +1,112 @@
-var S2 = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED");
-var DW = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
+// 1. Define Region of Interest (ROI)
 var roi = ee.Geometry.Polygon(
-        [[[32.81201278251589, 1.7035206744239066],
-          [32.81201278251589, 1.272453722443622],
-          [33.32287704032839, 1.272453722443622],
-          [33.32287704032839, 1.7035206744239066]]], null, false);
+  [[[32.81201278251589, 1.7035206744239066],
+    [32.81201278251589, 1.272453722443622],
+    [33.32287704032839, 1.272453722443622],
+    [33.32287704032839, 1.7035206744239066]]], null, false);
 
-Map.addLayer(roi, {palette:'black'}, "roi");
+// 2. Display ROI on the map
+Map.addLayer(roi, {palette: 'black'}, "ROI");
 
-var S2bands = ['B1','B2','B3','B4','B5','B6','B7','B8','B8A','B9','B11','B12',
-'LSWI','mNDWI','NDWI','AWEIsh','AWEInsh','ndvi','evi','savi'];
-// Define the time and scope of the study area
+// 3. Define Sentinel-2 bands and time range for the study
+var S2bands = ['B1', 'B2', 'B3', 'B4', 'B5', 'B6', 'B7', 'B8', 'B8A', 'B9', 'B11', 'B12',
+    'LSWI', 'mNDWI', 'NDWI', 'AWEIsh', 'AWEInsh', 'ndvi', 'evi', 'savi'];
 var startDate = '2023-01-01';
-var endDate = '2023-2-01';
+var endDate = '2023-02-01';
 
-// Load Sentinel-2 data
-var S2_image = S2.filterBounds(roi)
-                  .filterDate('2023-01-01', '2023-02-01')
-                  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
-                  .map(maskS2clouds)
-                  .map(S2addIndices)
-                  .select(S2bands)
-                  .map(function(image) {
-                    return image.clip(roi);
-                  });
+// 4. Load and preprocess Sentinel-2 data
+var S2_image = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 20))
+  .map(maskS2clouds)
+  .map(S2addIndices)
+  .select(S2bands)
+  .map(function(image) { return image.clip(roi); });
 
 var S2_median = S2_image.median();
-print('S2_median for month:',S2_median);
-  
-// Loading Dynamic World data
-var dwComposite = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
-                    .filterDate(startDate, endDate)
-                    .filterBounds(roi)
-                    .select('label')
-                    .reduce(ee.Reducer.mode())
-                    .clip(roi);
+print('Sentinel-2 Median Image:', S2_median);
 
-var dwCompositeRemapped = dwComposite.remap([0,1,2,3,4,5,6,7,8],[0,1,1,1,1,1,2,3,4]).rename('landcover');
-// Combine the data from Sentinel-2 with that from Dynamic World
+// 5. Load and preprocess Dynamic World data
+var dwComposite = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+  .filterBounds(roi)
+  .filterDate(startDate, endDate)
+  .select('label')
+  .reduce(ee.Reducer.mode())
+  .clip(roi);
+
+var dwCompositeRemapped = dwComposite.remap([0, 1, 2, 3, 4, 5, 6, 7, 8], [0, 1, 1, 1, 1, 1, 2, 3, 4]).rename('landcover');
+
+// 6. Combine Sentinel-2 and Dynamic World data
 var S2Features = S2_median.addBands(dwCompositeRemapped);
- print('S2Features for roi', S2Features);
+print('Combined Sentinel-2 and Dynamic World Features:', S2Features);
 
-// step sampling
+// 7. Stratified Sampling for landcover classes
 var stratifiedSample = dwCompositeRemapped.stratifiedSample({
-    numPoints: 1000,  
-    classBand: 'landcover', 
-    region: roi,  
-    scale: 10, 
-    geometries: true
+  numPoints: 1000,
+  classBand: 'landcover',
+  region: roi,
+  scale: 10,
+  geometries: true
 });
-print('stratifiedSample',stratifiedSample);
+print('Stratified Sample:', stratifiedSample);
 
-// In S2_image_bands, use constrainedSample for sampling to obtain the band values at the corresponding positions
+// 8. Sample Sentinel-2 data using stratified samples
 var combinedSample = S2Features.sampleRegions({
   collection: stratifiedSample,
-  scale: 10,  
-  geometries: true 
+  scale: 10,
+  geometries: true
 });
+print('Combined Sample:', combinedSample);
 
-print('combinedSample',combinedSample);
-Map.addLayer(S2_median, {bands: ['B8', 'B3', 'B2'], min: 0, max: 0.3}, 'S2_resampled');
-  
-// Visual sampling points
-var sampleVisParams1 = {color: 'red', pointSize: 5};
-Map.addLayer(stratifiedSample, sampleVisParams1, 'Sample Landcover ');
+// 9. Visualize Sentinel-2 data and stratified samples
+Map.addLayer(S2_median, {bands: ['B8', 'B3', 'B2'], min: 0, max: 0.3}, 'S2 Resampled');
+Map.addLayer(stratifiedSample, {color: 'red', pointSize: 5}, 'Sample Landcover');
+
+// 10. Split into training and test samples
 var alldata = combinedSample.randomColumn('random');
+var training_samples = alldata.filter(ee.Filter.lte('random', 0.7));
+var test_samples = alldata.filter(ee.Filter.gte('random', 0.7));
+print("Training Samples:", training_samples);
+print("Test Samples:", test_samples);
 
-//Divide the samples into training samples and test samples
-var training_samples = alldata.filter(ee.Filter.lte('random',0.7)); 
-var test_samples = alldata.filter(ee.Filter.gte('random',0.7));
-// Check whether the filtered samples possess complete band information.
-print("Filtered Training Samples:", training_samples);
-print("Filtered Test Samples:", test_samples);
-
+// 11. Train RandomForest classifier
 var classifier = ee.Classifier.smileRandomForest(100).train({
-  features:training_samples,
-  classProperty:'landcover',
-  inputProperties:S2bands
-})
-var classifed = S2_median.classify(classifier);
-var VIS_PALETTE = ['blue', 'green', 'red','yellow','white'];
-
-// Modify the label values of the classification results, changing 0, 1, 2, 3 to 1, 2, 3, 4.
-var updated_classified = classifed.remap([0,1,2,3,4], [1,2,3,4,5]);
-
-Map.addLayer(updated_classified, {min:1, max:5, palette:VIS_PALETTE}, 'landcover updated');
-
-// Export the sample set as an SHP file and categorize by month.
-Export.table.toDrive({
-    collection: combinedSample,
-    description: 'S2Samples_202301',
-    fileFormat: 'SHP'
+  features: training_samples,
+  classProperty: 'landcover',
+  inputProperties: S2bands
 });
 
-// Export S1_imageCount to the cloud hard drive
+// 12. Classify Sentinel-2 data
+var classified = S2_median.classify(classifier);
+
+// 13. Remap classification results and visualize
+var updated_classified = classified.remap([0, 1, 2, 3, 4], [1, 2, 3, 4, 5]);
+var VIS_PALETTE = ['blue', 'green', 'red', 'yellow', 'white'];
+Map.addLayer(updated_classified, {min: 1, max: 5, palette: VIS_PALETTE}, 'Updated Landcover Classification');
+
+// 14. Export the stratified sample and classified image
+Export.table.toDrive({
+  collection: combinedSample,
+  description: 'S2Samples_202301',
+  fileFormat: 'SHP'
+});
+
 Export.image.toDrive({
   image: updated_classified,
   description: '202301classify',
-  fileNamePrefix: '202301classify', 
-  region: roi,  
-  scale: 10,  
+  fileNamePrefix: '202301classify',
+  region: roi,
+  scale: 10,
   maxPixels: 1e13,
   fileFormat: 'GeoTIFF'
 });
 
-// Define the index functions for water bodies, vegetation, and architectural features
+// 15. Define the function to add indices to Sentinel-2 images
 function S2addIndices(image) {
-  // Land Surface Water Index (LSWI)
   var lswi = image.normalizedDifference(['B8', 'B12']).rename('LSWI');
-  
-  // Modified Normalized Difference Water Index (mNDWI)
   var mndwi = image.normalizedDifference(['B3', 'B11']).rename('mNDWI');
-  
-  // Normalized Difference Water Index (NDWI)
   var ndwi = image.normalizedDifference(['B3', 'B8']).rename('NDWI');
-  
-  // Automated Water Extraction Index for shadow (AWEIsh)
   var aweish = image.expression(
     'B2 + 2.5 * B3 - 1.5 * (B8 + B11) - 0.25 * B12', {
       'B2': image.select('B2'),
@@ -124,8 +115,6 @@ function S2addIndices(image) {
       'B11': image.select('B11'),
       'B12': image.select('B12')
   }).rename('AWEIsh').toFloat();
-  
-  // Automated Water Extraction Index for non-shadow (AWEInsh)
   var aweinsh = image.expression(
     '4 * (B2 - B11) - (0.25 * B8 + 2.75 * B12)', {
       'B2': image.select('B2'),
@@ -133,31 +122,27 @@ function S2addIndices(image) {
       'B11': image.select('B11'),
       'B12': image.select('B12')
   }).rename('AWEInsh').toFloat();
-  
   var ndvi = image.normalizedDifference(['B8', 'B4']).rename('ndvi');
-  
-  var evi = image.expression(  
-    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))',{
-    NIR:image.select('B5'),
-    RED:image.select('B4'),
-    BLUE:image.select('B2')}).rename('evi');
-    
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      NIR: image.select('B5'),
+      RED: image.select('B4'),
+      BLUE: image.select('B2')
+  }).rename('evi');
   var savi = image.expression(
     '1.5 * ((NIR - RED) / (NIR + RED + 0.5))', {
       'NIR': image.select('B8'),
       'RED': image.select('B4'),
   }).rename('savi');
-  
-  // Add the exponent for the calculation as the return value for the new band.
-  return image.addBands([lswi,mndwi,ndwi,aweish,aweinsh,ndvi,evi,savi]);
+  return image.addBands([lswi, mndwi, ndwi, aweish, aweinsh, ndvi, evi, savi]);
 }
 
-// Define the cloud mask function
+// 16. Cloud mask function for Sentinel-2
 function maskS2clouds(image) {
   var qa = image.select('QA60');
   var cloudBitMask = 1 << 10;
   var cirrusBitMask = 1 << 11;
   var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
-                .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
-  return image.updateMask(mask).divide(10000);  // Normalize the entire image
-} 
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);  // Normalize the image
+}
