@@ -1,17 +1,17 @@
+// 1. Define the Region of Interest (ROI)
 var roi = ee.Geometry.Polygon(
         [[[32.81201278251589, 1.7035206744239066],
           [32.81201278251589, 1.272453722443622],
           [33.32287704032839, 1.272453722443622],
           [33.32287704032839, 1.7035206744239066]]], null, false);
 
-// Set the time range
+// 2. Set the time range for the analysis
 var startDate = '2023-11-01';
 var endDate = '2023-12-01';
 
-// Use the JRC dataset
+// 3. Load and visualize Global Surface Water (GSW) dataset
 var band = ['occurrence'];
 var GSW = ee.Image('JRC/GSW1_4/GlobalSurfaceWater').clip(roi).select(band);
-// Visualization of water body occurrence frequency
 var visualization = {
   bands: ['occurrence'],
   min: 0.0,
@@ -20,69 +20,63 @@ var visualization = {
 };
 Map.addLayer(GSW, visualization, 'Occurrence');
 
-// Use the Sentinel-1 dataset
+// 4. Load Sentinel-1 image collection and filter by polarization and time range
 var s1Collection = ee.ImageCollection('COPERNICUS/S1_GRD')
   .filterBounds(roi)
   .filterDate(startDate, endDate)
   .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV'))
-  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))  // 确保含有VH极化
+  .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VH'))  // Ensure VH polarization is included
   .filter(ee.Filter.eq('instrumentMode', 'IW'));
 
-// Define the SDWI calculation function
-function S1addIndices(image) {
+// 5. Define SDWI calculation function for Sentinel-1
+function calculateSDWI(image) {
   var vv = image.select('VV');
   var vh = image.select('VH');
   var SDWI = image.expression('log(10*VV*VH)-8', {'VV': vv, 'VH': vh}).rename('SDWI');
   return image.addBands([SDWI]);
 }
 
-// Calculate SDWI
-var s1SDWI = s1Collection.map(S1addIndices).select("SDWI");
+// 6. Calculate SDWI for Sentinel-1 images
+var s1SDWI = s1Collection.map(calculateSDWI).select("SDWI");
 
-// Merge the SDWI layers
+// 7. Merge SDWI layers and apply median filter
 var sdwiComposite = s1SDWI.median().clip(roi);
-// SNIC superpixel segmentation
+
+// 8. Perform SNIC superpixel segmentation
 var segmentation = ee.Algorithms.Image.Segmentation.SNIC({
     image: sdwiComposite,
     size: 14,  
     compactness: 0.1, 
     connectivity: 8  
-  }).select(['SDWI_mean', 'clusters'], ['SDWI', 'clusters']);
-// Edge-Otsu
-var biocut = segmentation.select('SDWI').gte(0.59);
+}).select(['SDWI_mean', 'clusters'], ['SDWI', 'clusters']);
+
+// 9. Perform Edge-Otsu algorithm for water body extraction
+var biocut = segmentation.select('SDWI').gte(0.59); // Thresholding SDWI to identify water
 var canny = ee.Algorithms.CannyEdgeDetector(biocut, 1, 1);
-canny = canny.clip(roi).unmask();
 var connected = canny.updateMask(canny).lt(0.05).connectedPixelCount(500, true);
 var edges = connected.gte(5);
-edges = edges.updateMask(edges);
 var edgeBuffer = edges.focal_max(5, 'square', 'meters');
 var histogram_image = segmentation.select('SDWI').updateMask(edgeBuffer);
+
+// 10. Compute histogram and apply Otsu thresholding
 var histogram_ = histogram_image.select('SDWI').reduceRegion({
     reducer: ee.Reducer.histogram(255, 0.25),
     geometry: roi,
     scale: 10,
     bestEffort: true
 });
+
 var hist_dict = histogram_.getInfo();
 var threshold1 = otsu(histogram_.get('SDWI'));
 var waterImgPre = ee.Image(ee.Algorithms.If(false, segmentation.lt(threshold1), segmentation.gt(threshold1))).selfMask().clip(roi);
 var waterImg = waterImgPre.select('SDWI').unmask(0);
 
-Map.addLayer(waterImg, {min:0,max:1,palette:['white','blue']}, 'WaterImg');
-
-// Visualized water body mask
-var visParams = {
-  min: 0,
-  max: 1,
-  palette: ['FFFFFF', '0000FF'] 
-};
-
-// Display the water mask on the map
+// 11. Display results
 Map.centerObject(roi, 10);
-Map.addLayer(sdwiComposite, {bands: ['SDWI'], min: -1, max: 1}, "sentinel-1");
-Map.addLayer(waterImg, visParams, 'SDWI Water Mask SNIC');
+Map.addLayer(sdwiComposite, {bands: ['SDWI'], min: -1, max: 1}, "Sentinel-1 SDWI Composite");
+Map.addLayer(waterImg, {min:0, max:1, palette:['white', 'blue']}, 'Water Mask');
 
-// Export the results to the cloud hard drive
+// 12. Export the water mask as GeoTIFF
 Export.image.toDrive({
   image: waterImg,
   description: 'CMDIF_S1',
@@ -93,7 +87,7 @@ Export.image.toDrive({
   fileFormat: 'GeoTIFF' 
 });
 
-// Define the OTSU algorithm
+// 13. Define the Otsu algorithm for thresholding
 function otsu(histogram) {
     var counts = ee.Array(ee.Dictionary(histogram).get('histogram'));
     var means = ee.Array(ee.Dictionary(histogram).get('bucketMeans'));
@@ -104,20 +98,18 @@ function otsu(histogram) {
 
     var indices = ee.List.sequence(1, size);
 
-    // Compute between sum of squares, where each mean partitions the data.
+    // Compute between sum of squares (BSS)
     var bss = indices.map(function(i) {
         var aCounts = counts.slice(0, 0, i);
         var aCount = aCounts.reduce(ee.Reducer.sum(), [0]).get([0]);
         var aMeans = means.slice(0, 0, i);
-        var aMean = aMeans.multiply(aCounts)
-            .reduce(ee.Reducer.sum(), [0]).get([0])
-            .divide(aCount);
+        var aMean = aMeans.multiply(aCounts).reduce(ee.Reducer.sum(), [0]).get([0]).divide(aCount);
         var bCount = total.subtract(aCount);
         var bMean = sum.subtract(aCount.multiply(aMean)).divide(bCount);
         return aCount.multiply(aMean.subtract(mean).pow(2)).add(
             bCount.multiply(bMean.subtract(mean).pow(2)));
     });
 
-    // Return the mean value corresponding to the maximum BSS.
+    // Return the mean value corresponding to the maximum BSS
     return means.sort(bss).get([-1]);
 }
